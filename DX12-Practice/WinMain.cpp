@@ -274,6 +274,115 @@ ComPtr<ID3D12GraphicsCommandList> CreateCommandList(ComPtr<ID3D12Device2> device
     return commandList;
 }
 
+ComPtr<ID3D12Fence> CreateFence(ComPtr<ID3D12Device2> device)
+{
+    ComPtr<ID3D12Fence> fence;
+    device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    return fence;
+}
+
+uint64_t Signal(ComPtr<ID3D12CommandQueue> commandQueue, ComPtr<ID3D12Fence> fence, uint64_t& fenceValue)
+{
+    uint64_t fenceValueForSignal = ++fenceValue;
+    commandQueue->Signal(fence.Get(), fenceValueForSignal);
+    return fenceValueForSignal;
+}
+
+HANDLE CreateEventHandle()
+{
+    HANDLE fenceEvent;
+    fenceEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    return fenceEvent;
+}
+
+void WaitForFenceValue(ComPtr<ID3D12Fence> fence, uint64_t fenceValue, HANDLE fenceEvent, std::chrono::milliseconds duration = std::chrono::milliseconds::max())
+{
+    if (fence->GetCompletedValue() < fenceValue)
+    {
+        fence->SetEventOnCompletion(fenceValue, fenceEvent);
+        WaitForSingleObject(fenceEvent, static_cast<DWORD>(duration.count()));
+    }
+}
+
+void Flush(ComPtr<ID3D12CommandQueue> commandQueue, ComPtr<ID3D12Fence> fence, uint64_t& fenceValue, HANDLE fenceEvent)
+{
+    uint64_t fenceValueForSignal = Signal(commandQueue, fence, fenceValue);
+    WaitForFenceValue(fence, fenceValueForSignal, fenceEvent);
+}
+
+void Update()
+{
+    static uint64_t frameCounter = 0;
+    static double elapsedSeconds = 0.0;
+    static std::chrono::high_resolution_clock clock;
+    static auto t0 = clock.now();
+
+    frameCounter++;
+    auto t1 = clock.now();
+    auto deltaTime = t1 - t0;
+    t0 = t1;
+
+    elapsedSeconds += deltaTime.count() * 1e-9;
+    if (elapsedSeconds > 1.0)
+    {
+        char buffer[500];
+        auto fps = frameCounter / elapsedSeconds;
+        sprintf_s(buffer, 500, "FPS: %f\n", fps);
+        OutputDebugStringA(buffer);
+
+        frameCounter = 0;
+        elapsedSeconds = 0.0;
+    }
+}
+
+void Render()
+{
+    auto commandAllocator = g_CommandAllocators[g_CurrentBackBufferIndex];
+    auto backBuffer = g_BackBuffers[g_CurrentBackBufferIndex];
+
+    commandAllocator->Reset();
+    g_CommandList->Reset(commandAllocator.Get(), nullptr);
+
+    // Clear the render target.
+    {
+        CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            backBuffer.Get(),
+            D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET
+        );
+
+        g_CommandList->ResourceBarrier(1, &barrier);
+
+        FLOAT clearColor[] = { 0.2f, 0.8f, 0.8f, 1.0f };
+        CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(g_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+            g_CurrentBackBufferIndex, g_RTVDescriptorSize);
+
+        g_CommandList->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
+    }
+
+    // Present
+    {
+        CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            backBuffer.Get(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        
+        g_CommandList->ResourceBarrier(1, &barrier);
+        g_CommandList->Close();
+
+        ID3D12CommandList* const commandLists[] = {
+            g_CommandList.Get()
+        };
+        g_CommandQueue->ExecuteCommandLists(_countof(commandLists), commandLists);
+
+        UINT syncInterval = g_VSync ? 1 : 0;
+        UINT presentFlags = g_TearingSupported && !g_VSync ? DXGI_PRESENT_ALLOW_TEARING : 0;
+        g_SwapChain->Present(syncInterval, presentFlags);
+
+        g_FrameFenceValues[g_CurrentBackBufferIndex] = Signal(g_CommandQueue, g_Fence, g_FenceValue);
+        g_CurrentBackBufferIndex = g_SwapChain->GetCurrentBackBufferIndex();
+        WaitForFenceValue(g_Fence, g_FrameFenceValues[g_CurrentBackBufferIndex], g_FenceEvent);
+    }
+}
+
 int CALLBACK WinMain(
 	_In_     HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -283,10 +392,38 @@ int CALLBACK WinMain(
     const wchar_t* windowClassName = L"DX12WindowClass";
     const wchar_t* windowTitle = L"Learning DirectX 12";
 
-    RegisterWindowClass(hInstance, windowClassName);
-    g_hWnd = CreateWindowInstance(windowClassName, hInstance, windowTitle, g_ClientWidth, g_ClientHeight);
-    ShowWindow(g_hWnd, SW_SHOW);
+    // create window
+    {
+        RegisterWindowClass(hInstance, windowClassName);
+        g_hWnd = CreateWindowInstance(windowClassName, hInstance, windowTitle, g_ClientWidth, g_ClientHeight);
+        ShowWindow(g_hWnd, SW_SHOW);
+    }
+    
+    // init graphic
+    {
+        g_TearingSupported = CheckTearingSupport();
+        ComPtr<IDXGIAdapter4> dxgiAdapter4 = GetAdapter(g_UseWarp);
 
+        g_Device = CreateDevice(dxgiAdapter4);
+        g_CommandQueue = CreateCommandQueue(g_Device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        g_SwapChain = CreateSwapChain(g_hWnd, g_CommandQueue, g_ClientWidth, g_ClientHeight, g_NumFrames);
+        g_CurrentBackBufferIndex = g_SwapChain->GetCurrentBackBufferIndex();
+        g_RTVDescriptorHeap = CreateDescriptorHeap(g_Device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, g_NumFrames);
+        g_RTVDescriptorSize = g_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+        UpdateRenderTargetViews(g_Device, g_SwapChain, g_RTVDescriptorHeap);
+
+        for (int i = 0; i < g_NumFrames; ++i)
+        {
+            g_CommandAllocators[i] = CreateCommandAllocator(g_Device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        }
+        g_CommandList = CreateCommandList(g_Device, g_CommandAllocators[g_CurrentBackBufferIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
+        g_Fence = CreateFence(g_Device);
+        g_FenceEvent = CreateEventHandle();
+        g_IsInitialized = true;
+    }
+
+    // handle window message
     MSG msg = {};
     while (msg.message != WM_QUIT)
     {
@@ -297,10 +434,24 @@ int CALLBACK WinMain(
         }
     }
 
+    // check finish and release resource before closing
+    Flush(g_CommandQueue, g_Fence, g_FenceValue, g_FenceEvent);
+    CloseHandle(g_FenceEvent);
+
 	return 0;
 }
 
 LRESULT CALLBACK WindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg)
+    {
+    case WM_PAINT:
+        Update();
+        Render();
+        break;
+    case WM_CLOSE:
+        PostQuitMessage(0);
+        break;
+    }
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
