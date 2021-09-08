@@ -325,13 +325,13 @@ void Update()
     elapsedSeconds += deltaTime.count() * 1e-9;
     if (elapsedSeconds > 1.0)
     {
-        char buffer[500];
         auto fps = frameCounter / elapsedSeconds;
-        sprintf_s(buffer, 500, "FPS: %f\n", fps);
-        OutputDebugStringA(buffer);
-
         frameCounter = 0;
         elapsedSeconds = 0.0;
+
+        wchar_t text_buffer[64];
+        swprintf(text_buffer, _countof(text_buffer), L"FPS: %f\n", fps);
+        OutputDebugString(text_buffer);
     }
 }
 
@@ -425,13 +425,27 @@ int CALLBACK WinMain(
 
     // handle window message
     MSG msg = {};
-    while (msg.message != WM_QUIT)
+    bool quit = false;
+    while (true)
     {
-        if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
         {
+            if (msg.message == WM_QUIT)
+            {
+                quit = true;
+                break;
+            }
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
+
+        if (quit)
+        {
+            break;
+        }
+
+        Update();
+        Render();
     }
 
     // check finish and release resource before closing
@@ -444,13 +458,21 @@ int CALLBACK WinMain(
 LRESULT CALLBACK WindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg)
     {
-    case WM_PAINT:
-        Update();
-        Render();
-        break;
     case WM_CLOSE:
         PostQuitMessage(0);
         break;
+    case WM_KEYDOWN:
+    {
+        if (!(lParam & 0x40000000)) // filter repeat
+        {
+            auto c = static_cast<unsigned char>(wParam);
+            if (c == 'V')
+            {
+                g_VSync = !g_VSync;
+            }
+        }
+        break;
+    }
     }
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
